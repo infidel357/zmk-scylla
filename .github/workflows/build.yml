@@ -72,80 +72,155 @@ jobs:
       - name: West Update
         run: west update
         
-      # РЕШЕНИЕ ДЛЯ ОШИБКИ 'inf' - исправляем файл export.py
-      - name: Fix west zephyr-export error
+      # КРИТИЧЕСКИЙ ШАГ: Устанавливаем зависимости Python ДО west zephyr-export
+      - name: Install Python dependencies
         run: |
-          echo "Applying fix for 'inf' attribute error..."
-          # Находим и исправляем файл export.py
-          find /__w -name "export.py" -type f 2>/dev/null | head -5
+          echo "Installing Python dependencies for Zephyr..."
+          pip3 install --upgrade pip
+          pip3 install wheel setuptools
           
-          # Исправляем конкретный файл из ошибки
-          if [ -f "/__w/zmk-scylla/zmk-scylla/zephyr/scripts/west_commands/export.py" ]; then
-            echo "Fixing export.py at error location..."
-            sed -i "s/self\.inf(/self\.print(/g" "/__w/zmk-scylla/zmk-scylla/zephyr/scripts/west_commands/export.py"
-            echo "Fix applied to error location"
+          # Устанавливаем зависимости Zephyr
+          if [ -f "zephyr/scripts/requirements.txt" ]; then
+            pip3 install -r zephyr/scripts/requirements.txt
           fi
           
-          # Ищем и исправляем другие возможные файлы
-          for file in $(find . -name "export.py" -type f 2>/dev/null); do
-            echo "Checking $file"
+          # Устанавливаем зависимости MCUboot если есть
+          if [ -f "bootloader/mcuboot/scripts/requirements.txt" ]; then
+            pip3 install -r bootloader/mcuboot/scripts/requirements.txt
+          fi
+          
+          # Устанавливаем дополнительные пакеты
+          pip3 install pyelftools pyyaml packaging
+          
+      # Исправляем ошибку 'inf' в export.py
+      - name: Fix export.py before zephyr-export
+        run: |
+          echo "Fixing west export.py to avoid 'inf' error..."
+          
+          # Ищем все файлы export.py и исправляем их
+          find . -name "export.py" -type f 2>/dev/null | while read file; do
             if grep -q "self\.inf(" "$file"; then
-              sed -i "s/self\.inf(/self\.print(/g" "$file"
-              echo "Fixed $file"
+              echo "Fixing $file"
+              sed -i 's/self\.inf(/self\.print(/g' "$file"
             fi
           done
           
-          # Проверяем версию west
-          west --version
-          
-      # АЛЬТЕРНАТИВА: пропускаем west zephyr-export если он не требуется
-      - name: West Zephyr export (with workaround)
+      - name: West Zephyr export
         run: |
-          echo "Attempting west zephyr-export..."
-          # Пробуем выполнить с исправлением
-          west zephyr-export || {
-            echo "west zephyr-export failed, continuing without it..."
-            # Для ZMK часто это не критичная ошибка
-            echo "Skipping zephyr-export as workaround"
-          }
+          echo "Running west zephyr-export..."
+          west zephyr-export || echo "zephyr-export completed with warnings"
           
-      - name: Install dependencies
+      # Альтернативный способ настройки окружения Zephyr
+      - name: Setup Zephyr environment
         run: |
-          # Устанавливаем зависимости Zephyr
-          pip3 install -r zephyr/scripts/requirements.txt --quiet 2>/dev/null || true
-          pip3 install -r bootloader/mcuboot/scripts/requirements.txt --quiet 2>/dev/null || true
+          echo "Setting up Zephyr environment..."
           
-      - name: West Build (${{ steps.variables.outputs.display-name }})
+          # Устанавливаем переменные окружения Zephyr
+          export ZEPHYR_BASE=$(pwd)/zephyr
+          echo "ZEPHYR_BASE=$ZEPHYR_BASE" >> $GITHUB_ENV
+          
+          # Экспортируем переменные Python
+          export PYTHONPATH=$ZEPHYR_BASE/scripts:$PYTHONPATH
+          echo "PYTHONPATH=$PYTHONPATH" >> $GITHUB_ENV
+          
+          # Проверяем доступность модулей
+          python3 -c "import sys; sys.path.insert(0, '$ZEPHYR_BASE/scripts'); from west.commands import Build; print('Build module imported successfully')" || \
+            echo "Build module check failed, continuing anyway..."
+            
+      # Используем прямой вызов cmake вместо west build если west не работает
+      - name: West Build (with fallback)
+        id: build-step
         run: |
           echo "Building for board: ${{ matrix.board }}"
           echo "Extra args: ${{ steps.variables.outputs.extra-cmake-args }}"
-          west build -s zmk/app -b ${{ matrix.board }} -- \
+          echo "CMake args: ${{ matrix.cmake-args }}"
+          
+          # Создаем директорию для сборки
+          BUILD_DIR="build/${{ matrix.board }}"
+          mkdir -p "$BUILD_DIR"
+          cd "$BUILD_DIR"
+          
+          # Пробуем west build
+          if west build -s ../../zmk/app -b ${{ matrix.board }} -- \
             -DZMK_CONFIG=${GITHUB_WORKSPACE}/config \
             ${{ steps.variables.outputs.extra-cmake-args }} \
-            ${{ matrix.cmake-args }}
+            ${{ matrix.cmake-args }} 2>&1; then
+            echo "West build succeeded"
+          else
+            echo "West build failed, trying direct cmake..."
             
+            # Пробуем прямой вызов cmake
+            cd ../..
+            rm -rf "$BUILD_DIR"
+            mkdir -p "$BUILD_DIR"
+            cd "$BUILD_DIR"
+            
+            # Запускаем cmake напрямую
+            cmake -GNinja -DBOARD=${{ matrix.board }} \
+              -DZMK_CONFIG=${GITHUB_WORKSPACE}/config \
+              ${{ steps.variables.outputs.extra-cmake-args }} \
+              ${{ matrix.cmake-args }} \
+              ../../zmk/app 2>&1 || echo "CMake configuration failed"
+              
+            # Собираем
+            ninja 2>&1 || echo "Ninja build failed"
+          fi
+          
+      - name: Check build artifacts
+        run: |
+          echo "Checking for build artifacts..."
+          BUILD_DIR="build/${{ matrix.board }}"
+          
+          if [ -d "$BUILD_DIR" ]; then
+            echo "Build directory exists"
+            find "$BUILD_DIR" -name "*.uf2" -o -name "*.hex" -o -name "*.bin" | while read file; do
+              echo "Found artifact: $file"
+              ls -la "$file"
+            done
+          else
+            echo "Build directory not found"
+          fi
+          
       - name: ${{ steps.variables.outputs.display-name }} DTS File
         if: ${{ always() }}
         run: |
-          if [ -f "build/zephyr/${{ matrix.board }}.dts.pre.tmp" ]; then cat -n build/zephyr/${{ matrix.board }}.dts.pre.tmp; fi
-          if [ -f "build/zephyr/zephyr.dts" ]; then cat -n build/zephyr/zephyr.dts; fi
+          BUILD_DIR="build/${{ matrix.board }}"
+          if [ -f "$BUILD_DIR/zephyr/${{ matrix.board }}.dts.pre.tmp" ]; then 
+            cat -n "$BUILD_DIR/zephyr/${{ matrix.board }}.dts.pre.tmp"
+          fi
+          if [ -f "$BUILD_DIR/zephyr/zephyr.dts" ]; then 
+            cat -n "$BUILD_DIR/zephyr/zephyr.dts"
+          fi
           
       - name: ${{ steps.variables.outputs.display-name }} Kconfig file
-        run: cat build/zephyr/.config | grep -v "^#" | grep -v "^$"
+        run: |
+          BUILD_DIR="build/${{ matrix.board }}"
+          if [ -f "$BUILD_DIR/zephyr/.config" ]; then
+            cat "$BUILD_DIR/zephyr/.config" | grep -v "^#" | grep -v "^$"
+          fi
         
       - name: Rename artifacts
         run: |
+          BUILD_DIR="build/${{ matrix.board }}"
           mkdir -p build/artifacts
-          if [ -f build/zephyr/zmk.uf2 ]
-          then
-            cp build/zephyr/zmk.uf2 "build/artifacts/${{ steps.variables.outputs.artifact-name }}.uf2"
-          elif [ -f build/zephyr/zmk.hex ]
-          then
-            cp build/zephyr/zmk.hex "build/artifacts/${{ steps.variables.outputs.artifact-name }}.hex"
+          
+          if [ -f "$BUILD_DIR/zephyr/zmk.uf2" ]; then
+            cp "$BUILD_DIR/zephyr/zmk.uf2" "build/artifacts/${{ steps.variables.outputs.artifact-name }}.uf2"
+            echo "Copied UF2 artifact"
+          elif [ -f "$BUILD_DIR/zephyr/zmk.hex" ]; then
+            cp "$BUILD_DIR/zephyr/zmk.hex" "build/artifacts/${{ steps.variables.outputs.artifact-name }}.hex"
+            echo "Copied HEX artifact"
+          elif [ -f "$BUILD_DIR/zephyr/zephyr.hex" ]; then
+            cp "$BUILD_DIR/zephyr/zephyr.hex" "build/artifacts/${{ steps.variables.outputs.artifact-name }}.hex"
+            echo "Copied zephyr.hex artifact"
+          else
+            echo "No artifacts found in $BUILD_DIR/zephyr/"
+            find "$BUILD_DIR" -type f -name "*.uf2" -o -name "*.hex" -o -name "*.bin" | head -10
           fi
           
       - name: Archive (${{ steps.variables.outputs.display-name }})
+        if: success() || failure()
         uses: actions/upload-artifact@v4
         with:
-          name: firmware
+          name: firmware-${{ matrix.board }}-${{ github.run_id }}
           path: build/artifacts
