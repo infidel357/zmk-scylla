@@ -72,155 +72,172 @@ jobs:
       - name: West Update
         run: west update
         
-      # КРИТИЧЕСКИЙ ШАГ: Устанавливаем зависимости Python ДО west zephyr-export
-      - name: Install Python dependencies
+      # Устанавливаем pip и Python зависимости в контейнере
+      - name: Install pip and dependencies
         run: |
-          echo "Installing Python dependencies for Zephyr..."
-          pip3 install --upgrade pip
-          pip3 install wheel setuptools
+          echo "Checking available package managers..."
           
-          # Устанавливаем зависимости Zephyr
+          # Проверяем, какие менеджеры пакетов доступны
+          if command -v apt-get &> /dev/null; then
+            echo "Using apt-get..."
+            apt-get update && apt-get install -y python3-pip python3-dev
+          elif command -v apk &> /dev/null; then
+            echo "Using apk..."
+            apk add python3 py3-pip python3-dev
+          elif command -v yum &> /dev/null; then
+            echo "Using yum..."
+            yum install -y python3-pip python3-devel
+          else
+            echo "No package manager found, trying alternative..."
+            # Пробуем установить pip через get-pip.py
+            python3 -c "import ensurepip; ensurepip.bootstrap()" || \
+            curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py && python3 get-pip.py
+          fi
+          
+          # Проверяем установку pip
+          python3 -m pip --version || pip --version || echo "Pip not available"
+          
+      # Устанавливаем зависимости для Zephyr
+      - name: Setup Python environment
+        run: |
+          echo "Setting up Python environment..."
+          
+          # Проверяем, что pip доступен
+          if command -v python3 -m pip &> /dev/null; then
+            PIP_CMD="python3 -m pip"
+          elif command -v pip3 &> /dev/null; then
+            PIP_CMD="pip3"
+          elif command -v pip &> /dev/null; then
+            PIP_CMD="pip"
+          else
+            echo "Pip not found, trying to install via ensurepip"
+            python3 -c "import ensurepip; ensurepip.bootstrap()"
+            PIP_CMD="python3 -m pip"
+          fi
+          
+          # Устанавливаем базовые пакеты
+          $PIP_CMD install --upgrade pip wheel setuptools || echo "Failed to upgrade pip"
+          
+          # Проверяем существование requirements файлов перед установкой
           if [ -f "zephyr/scripts/requirements.txt" ]; then
-            pip3 install -r zephyr/scripts/requirements.txt
+            echo "Installing zephyr requirements..."
+            $PIP_CMD install -r zephyr/scripts/requirements.txt || echo "Zephyr requirements installation failed"
+          else
+            echo "zephyr/scripts/requirements.txt not found"
           fi
           
-          # Устанавливаем зависимости MCUboot если есть
           if [ -f "bootloader/mcuboot/scripts/requirements.txt" ]; then
-            pip3 install -r bootloader/mcuboot/scripts/requirements.txt
+            echo "Installing mcuboot requirements..."
+            $PIP_CMD install -r bootloader/mcuboot/scripts/requirements.txt || echo "MCUboot requirements installation failed"
           fi
           
-          # Устанавливаем дополнительные пакеты
-          pip3 install pyelftools pyyaml packaging
+          # Устанавливаем минимальные необходимые пакеты
+          $PIP_CMD install pyelftools pyyaml packaging || echo "Failed to install core packages"
           
-      # Исправляем ошибку 'inf' в export.py
-      - name: Fix export.py before zephyr-export
+      # Пропускаем west zephyr-export если он вызывает проблемы
+      - name: Skip problematic west zephyr-export
         run: |
-          echo "Fixing west export.py to avoid 'inf' error..."
+          echo "Skipping west zephyr-export to avoid compatibility issues"
+          echo "For ZMK builds, this step is often not required"
           
-          # Ищем все файлы export.py и исправляем их
-          find . -name "export.py" -type f 2>/dev/null | while read file; do
-            if grep -q "self\.inf(" "$file"; then
-              echo "Fixing $file"
-              sed -i 's/self\.inf(/self\.print(/g' "$file"
-            fi
-          done
-          
-      - name: West Zephyr export
-        run: |
-          echo "Running west zephyr-export..."
-          west zephyr-export || echo "zephyr-export completed with warnings"
-          
-      # Альтернативный способ настройки окружения Zephyr
-      - name: Setup Zephyr environment
-        run: |
-          echo "Setting up Zephyr environment..."
-          
-          # Устанавливаем переменные окружения Zephyr
+          # Вместо этого устанавливаем переменные окружения вручную
           export ZEPHYR_BASE=$(pwd)/zephyr
-          echo "ZEPHYR_BASE=$ZEPHYR_BASE" >> $GITHUB_ENV
+          echo "ZEPHYR_BASE set to: $ZEPHYR_BASE"
           
-          # Экспортируем переменные Python
-          export PYTHONPATH=$ZEPHYR_BASE/scripts:$PYTHONPATH
-          echo "PYTHONPATH=$PYTHONPATH" >> $GITHUB_ENV
-          
-          # Проверяем доступность модулей
-          python3 -c "import sys; sys.path.insert(0, '$ZEPHYR_BASE/scripts'); from west.commands import Build; print('Build module imported successfully')" || \
-            echo "Build module check failed, continuing anyway..."
-            
-      # Используем прямой вызов cmake вместо west build если west не работает
-      - name: West Build (with fallback)
-        id: build-step
+      # Прямая сборка через west без zephyr-export
+      - name: Build with west
         run: |
           echo "Building for board: ${{ matrix.board }}"
+          echo "Shield: ${{ matrix.shield }}"
           echo "Extra args: ${{ steps.variables.outputs.extra-cmake-args }}"
-          echo "CMake args: ${{ matrix.cmake-args }}"
           
-          # Создаем директорию для сборки
-          BUILD_DIR="build/${{ matrix.board }}"
-          mkdir -p "$BUILD_DIR"
-          cd "$BUILD_DIR"
-          
-          # Пробуем west build
-          if west build -s ../../zmk/app -b ${{ matrix.board }} -- \
-            -DZMK_CONFIG=${GITHUB_WORKSPACE}/config \
+          # Собираем с west
+          west build -s zmk/app -b ${{ matrix.board }} -- \
+            -DZMK_CONFIG="${GITHUB_WORKSPACE}/config" \
             ${{ steps.variables.outputs.extra-cmake-args }} \
-            ${{ matrix.cmake-args }} 2>&1; then
-            echo "West build succeeded"
-          else
-            echo "West build failed, trying direct cmake..."
+            ${{ matrix.cmake-args || '' }}
             
-            # Пробуем прямой вызов cmake
-            cd ../..
-            rm -rf "$BUILD_DIR"
-            mkdir -p "$BUILD_DIR"
-            cd "$BUILD_DIR"
-            
-            # Запускаем cmake напрямую
-            cmake -GNinja -DBOARD=${{ matrix.board }} \
-              -DZMK_CONFIG=${GITHUB_WORKSPACE}/config \
-              ${{ steps.variables.outputs.extra-cmake-args }} \
-              ${{ matrix.cmake-args }} \
-              ../../zmk/app 2>&1 || echo "CMake configuration failed"
-              
-            # Собираем
-            ninja 2>&1 || echo "Ninja build failed"
+      # Альтернатива: сборка через make если west не работает
+      - name: Build with make (fallback)
+        if: failure()
+        run: |
+          echo "West build failed, trying make..."
+          
+          # Переходим в директорию ZMK
+          cd zmk/app
+          
+          # Экспортируем переменные окружения
+          export BOARD=${{ matrix.board }}
+          export ZMK_CONFIG=${GITHUB_WORKSPACE}/config
+          
+          if [ -n "${{ matrix.shield }}" ]; then
+            export SHIELD=${{ matrix.shield }}
           fi
           
-      - name: Check build artifacts
-        run: |
-          echo "Checking for build artifacts..."
-          BUILD_DIR="build/${{ matrix.board }}"
+          # Пробуем собрать через make
+          make || {
+            echo "Make failed, checking for build script..."
+            # Ищем скрипты сборки
+            ls -la
+          }
           
-          if [ -d "$BUILD_DIR" ]; then
-            echo "Build directory exists"
-            find "$BUILD_DIR" -name "*.uf2" -o -name "*.hex" -o -name "*.bin" | while read file; do
-              echo "Found artifact: $file"
-              ls -la "$file"
-            done
+      - name: Check build results
+        run: |
+          echo "Checking build results..."
+          
+          # Проверяем различные возможные расположения артефактов
+          if [ -f "build/zephyr/zmk.uf2" ]; then
+            echo "Found: build/zephyr/zmk.uf2"
+            ls -la build/zephyr/zmk.uf2
+          elif [ -f "build/zephyr/zmk.hex" ]; then
+            echo "Found: build/zephyr/zmk.hex"
+            ls -la build/zephyr/zmk.hex
+          elif [ -f "zmk/app/build/zephyr/zmk.uf2" ]; then
+            echo "Found: zmk/app/build/zephyr/zmk.uf2"
+            ls -la zmk/app/build/zephyr/zmk.uf2
           else
-            echo "Build directory not found"
+            echo "No standard artifacts found, searching..."
+            find . -name "*.uf2" -o -name "*.hex" -o -name "*.bin" 2>/dev/null | head -20
           fi
           
       - name: ${{ steps.variables.outputs.display-name }} DTS File
         if: ${{ always() }}
         run: |
-          BUILD_DIR="build/${{ matrix.board }}"
-          if [ -f "$BUILD_DIR/zephyr/${{ matrix.board }}.dts.pre.tmp" ]; then 
-            cat -n "$BUILD_DIR/zephyr/${{ matrix.board }}.dts.pre.tmp"
+          if [ -f "build/zephyr/${{ matrix.board }}.dts.pre.tmp" ]; then 
+            cat -n "build/zephyr/${{ matrix.board }}.dts.pre.tmp"
           fi
-          if [ -f "$BUILD_DIR/zephyr/zephyr.dts" ]; then 
-            cat -n "$BUILD_DIR/zephyr/zephyr.dts"
+          if [ -f "build/zephyr/zephyr.dts" ]; then 
+            cat -n "build/zephyr/zephyr.dts"
           fi
           
       - name: ${{ steps.variables.outputs.display-name }} Kconfig file
         run: |
-          BUILD_DIR="build/${{ matrix.board }}"
-          if [ -f "$BUILD_DIR/zephyr/.config" ]; then
-            cat "$BUILD_DIR/zephyr/.config" | grep -v "^#" | grep -v "^$"
+          if [ -f "build/zephyr/.config" ]; then
+            cat "build/zephyr/.config" | grep -v "^#" | grep -v "^$"
           fi
         
       - name: Rename artifacts
         run: |
-          BUILD_DIR="build/${{ matrix.board }}"
           mkdir -p build/artifacts
           
-          if [ -f "$BUILD_DIR/zephyr/zmk.uf2" ]; then
-            cp "$BUILD_DIR/zephyr/zmk.uf2" "build/artifacts/${{ steps.variables.outputs.artifact-name }}.uf2"
+          # Копируем артефакты из стандартного расположения
+          if [ -f "build/zephyr/zmk.uf2" ]; then
+            cp "build/zephyr/zmk.uf2" "build/artifacts/${{ steps.variables.outputs.artifact-name }}.uf2"
             echo "Copied UF2 artifact"
-          elif [ -f "$BUILD_DIR/zephyr/zmk.hex" ]; then
-            cp "$BUILD_DIR/zephyr/zmk.hex" "build/artifacts/${{ steps.variables.outputs.artifact-name }}.hex"
+          elif [ -f "build/zephyr/zmk.hex" ]; then
+            cp "build/zephyr/zmk.hex" "build/artifacts/${{ steps.variables.outputs.artifact-name }}.hex"
             echo "Copied HEX artifact"
-          elif [ -f "$BUILD_DIR/zephyr/zephyr.hex" ]; then
-            cp "$BUILD_DIR/zephyr/zephyr.hex" "build/artifacts/${{ steps.variables.outputs.artifact-name }}.hex"
-            echo "Copied zephyr.hex artifact"
           else
-            echo "No artifacts found in $BUILD_DIR/zephyr/"
-            find "$BUILD_DIR" -type f -name "*.uf2" -o -name "*.hex" -o -name "*.bin" | head -10
+            echo "No artifacts in standard location, searching..."
+            # Ищем артефакты в других местах
+            find . -name "zmk.uf2" -o -name "zmk.hex" 2>/dev/null | while read file; do
+              echo "Found: $file"
+              cp "$file" "build/artifacts/${{ steps.variables.outputs.artifact-name }}.${file##*.}"
+            done
           fi
           
-      - name: Archive (${{ steps.variables.outputs.display-name }})
-        if: success() || failure()
+      - name: Archive firmware
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-${{ matrix.board }}-${{ github.run_id }}
-          path: build/artifacts
+          name: firmware-${{ matrix.board }}-${{ github.run_number }}
+          path: build/artifacts/
